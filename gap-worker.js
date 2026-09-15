@@ -1,21 +1,23 @@
 importScripts("https://cdn.jsdelivr.net/npm/xterm-pty@0.9.4/workerTools.js");
 importScripts("https://cdn.jsdelivr.net/npm/fzstd@0.1.1/umd/index.js");
 
+const MOUNT_POINT = "/gap";
 const CHUNK_LIMIT = 64 * 1024 * 1024;
 
 async function fetchDataBlob() {
   const res = await fetch("gap.data.zst");
-  if (!res.ok) throw new Error(`gap.data.zst: ${res.status}`);
+  if (!res.ok) throw new Error(`gap.data.zst: HTTP ${res.status}`);
 
-  const blobParts = [];
+  const parts = [];
   let pending = [];
   let pendingBytes = 0;
 
   const flush = () => {
-    if (!pending.length) return;
-    blobParts.push(new Blob(pending));
-    pending = [];
-    pendingBytes = 0;
+    if (pending.length) {
+      parts.push(new Blob(pending));
+      pending = [];
+      pendingBytes = 0;
+    }
   };
 
   const dec = new fzstd.Decompress((chunk) => {
@@ -33,28 +35,50 @@ async function fetchDataBlob() {
   dec.push(new Uint8Array(0), true);
   flush();
 
-  return new Blob(blobParts, { type: "application/octet-stream" });
+  return new Blob(parts, { type: "application/octet-stream" });
+}
+
+async function fetchMetadata() {
+  const res = await fetch("gap.data.js.metadata");
+  if (!res.ok) throw new Error(`gap.data.js.metadata: HTTP ${res.status}`);
+  return res.json();
+}
+
+function resolveGapRoot(metadata) {
+  const init = (metadata.files || []).find((f) =>
+    f.filename.endsWith("/lib/init.g")
+  );
+  if (!init) throw new Error("lib/init.g is not in the package");
+  const mounted = MOUNT_POINT + "/" + init.filename.replace(/^\//, "");
+  return mounted.slice(0, -"lib/init.g".length);
 }
 
 onmessage = async (msg) => {
-  try {
-    const [blob, metadata] = await Promise.all([
-      fetchDataBlob(),
-      fetch("gap.data.js.metadata").then((r) => r.json()),
-    ]);
+  const [blob, metadata] = await Promise.all([fetchDataBlob(), fetchMetadata()]);
 
-    self.Module = self.Module || {};
-    self.Module.preRun = [
-      () => {
-        FS.mkdir("/gap");
-        FS.mount(WORKERFS, { packages: [{ metadata, blob }] }, "/gap");
-      },
-    ];
-
-    importScripts("gap.js");
-    emscriptenHack(new TtyClient(msg.data));
-  } catch (e) {
-    console.error(e.stack || e);
-    throw e;
+  if (metadata.remote_package_size !== undefined &&
+      metadata.remote_package_size !== blob.size) {
+    throw new Error(
+      `package size mismatch: ${blob.size} != ${metadata.remote_package_size}`
+    );
   }
+
+  const gaproot = resolveGapRoot(metadata);
+
+  self.Module = self.Module || {};
+
+  self.Module.arguments = ["-l", gaproot];
+
+  self.Module.preRun = [
+    () => {
+      FS.mkdir(MOUNT_POINT);
+      FS.mount(WORKERFS, { packages: [{ metadata, blob }] }, MOUNT_POINT);
+    },
+  ];
+
+  importScripts("gap.js");
+
+  if (!self.asmLibraryArg) self.asmLibraryArg = self.wasmImports;
+
+  emscriptenHack(new TtyClient(msg.data));
 };

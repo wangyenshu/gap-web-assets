@@ -53,32 +53,65 @@ function resolveGapRoot(metadata) {
   return mounted.slice(0, -"lib/init.g".length);
 }
 
-onmessage = async (msg) => {
-  const [blob, metadata] = await Promise.all([fetchDataBlob(), fetchMetadata()]);
-
-  if (metadata.remote_package_size !== undefined &&
-      metadata.remote_package_size !== blob.size) {
-    throw new Error(
-      `package size mismatch: ${blob.size} != ${metadata.remote_package_size}`
-    );
+function patchEmscriptenInternals() {
+  if (!self.asmLibraryArg) {
+    if (!self.wasmImports) {
+      throw new Error("no syscall import table (asmLibraryArg/wasmImports)");
+    }
+    self.asmLibraryArg = self.wasmImports;
   }
 
-  const gaproot = resolveGapRoot(metadata);
+  if (self.SYSCALLS && typeof self.SYSCALLS.get !== "function") {
+    if (typeof self.syscallGetVarargI === "function") {
+      self.SYSCALLS.get = self.syscallGetVarargI;
+    } else if (self.SYSCALLS.varargs !== undefined) {
+      self.SYSCALLS.get = () => {
+        const ret = self.HEAP32[self.SYSCALLS.varargs >> 2];
+        self.SYSCALLS.varargs += 4;
+        return ret;
+      };
+    } else {
+      throw new Error("cannot reconstruct SYSCALLS.get for this Emscripten");
+    }
+  }
+}
 
-  self.Module = self.Module || {};
+onmessage = async (msg) => {
+  try {
+    const [blob, metadata] = await Promise.all([
+      fetchDataBlob(),
+      fetchMetadata(),
+    ]);
 
-  self.Module.arguments = ["-l", gaproot];
+    if (
+      metadata.remote_package_size !== undefined &&
+      metadata.remote_package_size !== blob.size
+    ) {
+      throw new Error(
+        `package size mismatch: ${blob.size} != ${metadata.remote_package_size}`
+      );
+    }
 
-  self.Module.preRun = [
-    () => {
-      FS.mkdir(MOUNT_POINT);
-      FS.mount(WORKERFS, { packages: [{ metadata, blob }] }, MOUNT_POINT);
-    },
-  ];
+    const gaproot = resolveGapRoot(metadata);
 
-  importScripts("gap.js");
+    self.Module = self.Module || {};
 
-  if (!self.asmLibraryArg) self.asmLibraryArg = self.wasmImports;
+    self.Module.arguments = ["-l", gaproot];
 
-  emscriptenHack(new TtyClient(msg.data));
+    self.Module.preRun = [
+      () => {
+        FS.mkdir(MOUNT_POINT);
+        FS.mount(WORKERFS, { packages: [{ metadata, blob }] }, MOUNT_POINT);
+      },
+    ];
+
+    importScripts("gap.js");
+
+    patchEmscriptenInternals();
+
+    emscriptenHack(new TtyClient(msg.data));
+  } catch (e) {
+    console.error("[gap]", e && e.stack ? e.stack : e);
+    throw e;
+  }
 };
